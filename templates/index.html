@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PineScript Optimizer</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header>
+        <h1>PineScript Optimizer</h1>
+    </header>
+    <main>
+        <section id="upload-indicators">
+            <h2>Upload Indicators</h2>
+            <input type="file" id="indicator-upload" multiple>
+            <button id="upload-btn">Upload</button>
+        </section>
+
+        <section id="parameter-display">
+            <h2>Parameters</h2>
+            <div id="parameter-list">
+                <!-- Parameters will be displayed here -->
+            </div>
+        </section>
+
+        <section id="optimization-settings">
+            <h2>Optimization Settings</h2>
+            <label for="optimization-iterations">Iterations:</label>
+            <input type="number" id="optimization-iterations" value="1000">
+            <label for="timeout">Timeout:</label>
+            <input type="number" id="timeout" value="60"> (seconds)
+            <button id="optimize-btn">Start Optimization</button>
+        </section>
+
+        <section id="progress-tracking">
+            <h2>Progress Tracking</h2>
+            <progress id="optimization-progress" value="0" max="100"></progress>
+            <div id="progress-status">Status: Not started</div>
+        </section>
+
+        <section id="results-display">
+            <h2>Results</h2>
+            <div id="results-list">
+                <!-- Optimization results will be displayed here -->
+            </div>
+        </section>
+    </main>
+    <footer>
+        <p>&copy; 2026 PineScript Optimizer</p>
+    </footer>
+</body>
+</html>
