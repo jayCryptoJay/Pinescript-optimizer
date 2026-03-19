@@ -1,0 +1,659 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// Claude's LC Premium v11.0 — Lorentzian Classification + Tier 1 Research
+// ══════════════════════════════════════════════════════════════════════════════
+// Architecture:  KNN Classification + Dual-Kernel Regression (RQK + Gaussian)
+// New in v11:    IDW voting, Hurst regime filter, Choppiness filter, GKYZ feature
+// Features:      6-Dimensional (RSI, WT, CCI, ADX, RSI-short, GKYZ optional)
+// Distance:      Lorentzian / Manhattan / Euclidean (selectable)
+// Envelope:      Kernel-smoothed ATR for adaptive bands
+// Defaults:      Tuned from 199+ backtested experiments on SOL/USDT 4H
+// ══════════════════════════════════════════════════════════════════════════════
+//@version=6
+indicator("Claude's LC Premium v11", "CLC‑v11", overlay=true, max_bars_back=2500, max_lines_count=500, max_labels_count=500, max_boxes_count=50)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CUSTOM TYPES
+// ══════════════════════════════════════════════════════════════════════════════
+type SignalResult
+    int   score
+    float weightedScore
+    int   direction
+    float confidence
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS — CORE KNN
+// ══════════════════════════════════════════════════════════════════════════════
+var string G0 = "⚙️  Core KNN & Training"
+int    i_k           = input.int   (4,      "Neighbors Count (k)",    2,   50,   group=G0, tooltip="Number of nearest neighbors. k=4 confirmed optimal for SOL 4H via 199+ experiments. Lower = sharper signal, higher = smoother.")
+int    i_window      = input.int   (2000,   "Max Bars Back",          200, 2400, group=G0, tooltip="Historical search depth. 2000 on 4H ≈ 333 days of data.")
+int    i_labelBars   = input.int   (4,      "Label Lookahead",        2,   10,   group=G0, tooltip="How many bars forward to check outcome. 4 confirmed optimal.")
+float  i_resetFactor = input.float (0.75,   "Reset Factor",           0.1, 1.0,  0.05, group=G0, tooltip="Controls neighbor diversity threshold. At k=4, this has minimal effect.")
+int    i_fractalLag  = input.int   (2,      "Remote Fractals Offset", 1,   200,  group=G0, tooltip="Min bars ago for historical search. 2 is optimal (was 4 in v10.0). Biggest single pre-confidence gain.")
+string i_distMetric  = input.string("Manhattan", "Distance Metric",   options=["Lorentzian","Manhattan","Euclidean"], group=G0, tooltip="Manhattan best with simple voting. Lorentzian best with high confidence filtering (≥75%).")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS — v11 IDW & CONFIDENCE
+// ══════════════════════════════════════════════════════════════════════════════
+var string G0b = "🎯 v11: Weighted Voting & Confidence"
+bool   i_useIDW      = input.bool  (true,   "Use Inverse Distance Weighting", group=G0b, tooltip="Weight neighbor votes by 1/distance instead of equal voting. Closer neighbors have more influence. Key Tier 1 upgrade.")
+float  i_confThresh  = input.float (0.50,   "Confidence Threshold",   0.50, 1.0, 0.05, group=G0b, tooltip="Min confidence to generate signal. 0.50=any majority. 0.75=75% consensus. Higher = fewer but better trades. With IDW this is weighted confidence.")
+float  i_idwEpsilon  = input.float (0.01,   "IDW Epsilon (floor)",    0.001, 0.1, 0.001, group=G0b, tooltip="Prevents division by zero in IDW. Smaller = more extreme weighting for very close neighbors.")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS — FEATURES
+// ══════════════════════════════════════════════════════════════════════════════
+var string G1 = "📊 Features"
+bool   i_f1On  = input.bool(true,  "Feature 1: RSI",       inline="f1", group=G1)
+int    i_f1P   = input.int (14,    "Period",  2, 50,       inline="f1", group=G1)
+bool   i_f1N   = input.bool(true,  "Normalize",            inline="f1", group=G1)
+float  i_f1W   = input.float(1.0,  "Weight", 0.1, 3.0, 0.1, inline="f1", group=G1, tooltip="Feature weight in distance calculation.")
+
+bool   i_f2On  = input.bool(true,  "Feature 2: WaveTrend", inline="f2", group=G1)
+int    i_f2P   = input.int (10,    "Channel",  2, 50,      inline="f2", group=G1)
+bool   i_f2N   = input.bool(true,  "Normalize",            inline="f2", group=G1)
+float  i_f2W   = input.float(1.0,  "Weight", 0.1, 3.0, 0.1, inline="f2", group=G1)
+
+bool   i_f3On  = input.bool(true,  "Feature 3: CCI",       inline="f3", group=G1)
+int    i_f3P   = input.int (20,    "Period",  2, 50,       inline="f3", group=G1)
+bool   i_f3N   = input.bool(true,  "Normalize",            inline="f3", group=G1)
+float  i_f3W   = input.float(1.0,  "Weight", 0.1, 3.0, 0.1, inline="f3", group=G1, tooltip="CCI was single biggest feature addition. Consider 1.5x weight.")
+
+bool   i_f4On  = input.bool(true,  "Feature 4: ADX",       inline="f4", group=G1)
+int    i_f4P   = input.int (20,    "Period",  2, 50,       inline="f4", group=G1)
+bool   i_f4N   = input.bool(true,  "Normalize",            inline="f4", group=G1)
+float  i_f4W   = input.float(1.5,  "Weight", 0.1, 3.0, 0.1, inline="f4", group=G1, tooltip="ADX weight at 1.5x confirmed valuable (near-zero WF degradation).")
+
+bool   i_f5On  = input.bool(true,  "Feature 5: RSI-Short", inline="f5", group=G1)
+int    i_f5P   = input.int (9,     "Period",  2, 50,       inline="f5", group=G1)
+bool   i_f5N   = input.bool(true,  "Normalize",            inline="f5", group=G1)
+float  i_f5W   = input.float(1.0,  "Weight", 0.1, 3.0, 0.1, inline="f5", group=G1)
+
+// v11: GKYZ Volatility as optional 6th feature
+var string G1b = "📊 v11: GKYZ Volatility Feature"
+bool   i_f6On  = input.bool(false, "Feature 6: GKYZ Volatility", group=G1b, tooltip="Garman-Klass-Yang-Zhang volatility. 7.4x more efficient than close-to-close. Captures OHLC range dynamics. Tier 2 feature — enable to test.")
+int    i_f6P   = input.int (20,    "Period",  5, 100,      group=G1b)
+bool   i_f6N   = input.bool(true,  "Normalize",            group=G1b)
+float  i_f6W   = input.float(1.0,  "Weight", 0.1, 3.0, 0.1, group=G1b)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS — FILTERS
+// ══════════════════════════════════════════════════════════════════════════════
+var string G2 = "🔒 Filters"
+bool   i_volFilter   = input.bool (true,  "Volatility Filter",      group=G2, tooltip="Suppress signals during volatility spikes (ATR1 > ATR10).")
+bool   i_adxFilter   = input.bool (true,  "ADX Filter",             group=G2)
+int    i_adxThresh   = input.int  (20,    "ADX Threshold",  5, 50,  group=G2, tooltip="Min ADX to generate signals. 20 confirmed optimal.")
+bool   i_emaFilter   = input.bool (true,  "EMA Filter",             group=G2)
+int    i_emaPeriod   = input.int  (6,     "EMA Period",     2, 100, group=G2, tooltip="EMA trend alignment. 6 confirmed best.")
+bool   i_smaFilter   = input.bool (true,  "SMA Filter",             group=G2)
+int    i_smaPeriod   = input.int  (220,   "SMA Period",     50,500, group=G2, tooltip="Long-term trend. SMA(220) prevents counter-trend disasters.")
+
+// v11: Regime Filters
+var string G2b = "🔒 v11: Regime Filters"
+bool   i_hurstFilter   = input.bool (false, "Hurst Exponent Filter",  group=G2b, tooltip="Suppress signals in trending/random regimes. Only trade when H < 0.45 (mean-reverting). Tier 1 upgrade — enable to test.")
+int    i_hurstPeriod   = input.int  (100,   "Hurst Lookback",  20, 500, group=G2b, tooltip="Lookback for R/S analysis. 100 bars on 4H ≈ 17 days.")
+float  i_hurstMRThresh = input.float(0.45,  "MR Threshold (H<)",  0.3, 0.5, 0.01, group=G2b, tooltip="H below this = mean-reverting regime. Default 0.45.")
+float  i_hurstRWLow    = input.float(0.45,  "Random Walk Low",    0.3, 0.5, 0.01, group=G2b, tooltip="H between this and RW High = random walk (suppress).")
+float  i_hurstRWHigh   = input.float(0.55,  "Random Walk High",   0.5, 0.7, 0.01, group=G2b, tooltip="H above this = trending (also suppress for MR strategy).")
+
+bool   i_chopFilter    = input.bool (false, "Choppiness Index Filter", group=G2b, tooltip="Suppress signals during strong trends (CHOP < 38.2). Simple, proven regime filter. Tier 1 upgrade — enable to test.")
+int    i_chopPeriod    = input.int  (14,    "CHOP Period",     7, 50, group=G2b, tooltip="Lookback for Choppiness Index.")
+float  i_chopTrend     = input.float(38.2,  "Trend Threshold (<)", 25, 50, 0.1, group=G2b, tooltip="Below this = strong trend. Suppress MR signals.")
+float  i_chopChoppy    = input.float(61.8,  "Choppy Threshold (>)", 50, 80, 0.1, group=G2b, tooltip="Above this = choppy/mean-reverting. Best regime for this strategy.")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS — KERNEL REGRESSION
+// ══════════════════════════════════════════════════════════════════════════════
+var string G3 = "📈 Kernel Regression"
+bool   i_kernelFilter = input.bool (true,   "Use Kernel Trend Gate",  group=G3, tooltip="Require kernel crossover confirmation for signals.")
+int    i_kernelLB     = input.int  (12,     "Lookback Window",  2, 100, group=G3)
+float  i_kernelRW     = input.float(8.0,    "Relative Weighting", 0.1, 50, 0.1, group=G3)
+int    i_kernelRL     = input.int  (25,     "Regression Level",  2, 50,  group=G3)
+int    i_kernelLag    = input.int  (2,      "Start Regression At",1, 25,  group=G3)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS — ENVELOPE
+// ══════════════════════════════════════════════════════════════════════════════
+var string G4 = "🎯 Envelope & Mean Reversion"
+bool   i_showEnv      = input.bool (true,   "Show Envelope",         group=G4)
+int    i_envATR       = input.int  (80,     "ATR Length",    10, 200, group=G4)
+float  i_envNear      = input.float(2.0,    "Near Factor",  0.5, 5,  0.1, group=G4)
+float  i_envFar       = input.float(3.0,    "Far Factor",   1.0, 10, 0.1, group=G4)
+bool   i_showMR       = input.bool (true,   "Show MR Signals",      group=G4)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS — TRADE LOGIC
+// ══════════════════════════════════════════════════════════════════════════════
+var string G5 = "💰 Trade Logic"
+bool   i_dynExit      = input.bool (true,   "Dynamic Exits",         group=G5)
+int    i_holdPeriod   = input.int  (5,      "Max Holding Period", 1, 30, group=G5, tooltip="Max bars to hold. 5 confirmed optimal for 4H.")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS — DISPLAY
+// ══════════════════════════════════════════════════════════════════════════════
+var string G6 = "🎨 Display"
+bool   i_showBarCol   = input.bool (true,   "Color Bars",            group=G6)
+bool   i_showStats    = input.bool (true,   "Show Stats Table",      group=G6)
+bool   i_showKernel   = input.bool (true,   "Show Kernel Lines",     group=G6)
+bool   i_showHurst    = input.bool (false,  "Show Hurst Value",      group=G6)
+bool   i_showChop     = input.bool (false,  "Show Choppiness Value", group=G6)
+color  i_cBull        = input.color(#00ffbb, "Bull",  inline="col",  group=G6)
+color  i_cBear        = input.color(#ff3355, "Bear",  inline="col",  group=G6)
+color  i_cNeutral     = input.color(#64748b, "Neutral", inline="col",group=G6)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// NORMALIZATION — Dual-Pole Filter + Tanh Pipeline
+// ══════════════════════════════════════════════════════════════════════════════
+_dpf(float src, int period) =>
+    var float out = na
+    co = math.exp(-math.sqrt(2) * math.pi / math.max(period, 1))
+    a1 = 2.0 * co * math.cos(math.sqrt(2) * math.pi / math.max(period, 1))
+    a2 = -(co * co)
+    b0 = 1.0 - a1 - a2
+    out := na(out[1]) ? src : b0 * src + a1 * nz(out[1]) + a2 * nz(out[2])
+    out
+
+_normalize(float src) =>
+    d     = src - nz(src[1])
+    rms   = math.sqrt(math.max(ta.sma(d * d, 10), 1e-10))
+    ratio = d / rms
+    clamped = math.max(-5.0, math.min(5.0, ratio))
+    tanhed  = (math.exp(2 * clamped) - 1) / (math.exp(2 * clamped) + 1)
+    _dpf(tanhed, 10)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FEATURE COMPUTATIONS
+// ══════════════════════════════════════════════════════════════════════════════
+// RSI
+_rsi(float src, int p) =>
+    ta.rsi(src, p)
+
+// WaveTrend
+_wt(int channel, int avg) =>
+    hlc3_  = (high + low + close) / 3
+    esa    = ta.ema(hlc3_, channel)
+    d      = ta.ema(math.abs(hlc3_ - esa), channel)
+    ci     = (hlc3_ - esa) / (0.015 * (d == 0 ? 1.0 : d))
+    ta.ema(ci, avg)
+
+// CCI
+_cci(int p) =>
+    ta.cci(close, p)
+
+// ADX
+_adx(int p) =>
+    up    = ta.change(high)
+    down  = -ta.change(low)
+    plusDM  = (up > down and up > 0) ? up : 0.0
+    minusDM = (down > up and down > 0) ? down : 0.0
+    atr_  = ta.rma(ta.tr, p)
+    pdi   = 100.0 * ta.rma(plusDM, p) / math.max(atr_, 1e-10)
+    mdi   = 100.0 * ta.rma(minusDM, p) / math.max(atr_, 1e-10)
+    dx    = 100.0 * math.abs(pdi - mdi) / math.max(pdi + mdi, 1e-10)
+    ta.rma(dx, p)
+
+// v11: GKYZ Volatility (Garman-Klass-Yang-Zhang)
+_gkyz(int p) =>
+    logOC  = math.log(open / nz(close[1], close))
+    logHL  = math.log(high / low)
+    logCO  = math.log(close / open)
+    // Yang-Zhang: overnight + Garman-Klass intraday
+    overnight_var = ta.sma(logOC * logOC, p)
+    gk_var = ta.sma(0.5 * logHL * logHL - (2.0 * math.log(2.0) - 1.0) * logCO * logCO, p)
+    yz_vol = math.sqrt(math.max(overnight_var + gk_var, 0.0))
+    // Normalize to 0-1 range using rolling min/max
+    lo = ta.lowest(yz_vol, p * 5)
+    hi = ta.highest(yz_vol, p * 5)
+    rng = hi - lo
+    rng > 0 ? (yz_vol - lo) / rng : 0.5
+
+// Compute all features unconditionally (Pine requires consistent series)
+f1_raw  = _rsi(close, i_f1P)
+f1_norm = _normalize(f1_raw)
+f1_val  = i_f1N ? f1_norm : f1_raw / 100.0
+
+f2_raw  = _wt(i_f2P, 11)
+f2_norm = _normalize(f2_raw)
+f2_val  = i_f2N ? f2_norm : f2_raw / 100.0
+
+f3_raw  = _cci(i_f3P)
+f3_norm = _normalize(f3_raw)
+f3_val  = i_f3N ? f3_norm : f3_raw / 200.0
+
+f4_raw  = _adx(i_f4P)
+f4_norm = _normalize(f4_raw)
+f4_val  = i_f4N ? f4_norm : f4_raw / 100.0
+
+f5_raw  = _rsi(close, i_f5P)
+f5_norm = _normalize(f5_raw)
+f5_val  = i_f5N ? f5_norm : f5_raw / 100.0
+
+f6_raw  = _gkyz(i_f6P)
+f6_norm = _normalize(f6_raw)
+f6_val  = i_f6N ? f6_norm : f6_raw
+
+// ══════════════════════════════════════════════════════════════════════════════
+// v11: HURST EXPONENT — Rescaled Range (R/S) Analysis
+// ══════════════════════════════════════════════════════════════════════════════
+_hurst(int period) =>
+    // R/S analysis at multiple subsample sizes
+    float sumLogRS = 0.0
+    float sumLogN  = 0.0
+    float sumLogRS2 = 0.0
+    float sumLogN2  = 0.0
+    int   count    = 0
+    
+    // Use 4 subsample sizes: period/8, period/4, period/2, period
+    for s = 0 to 3
+        n = math.max(8, int(period / math.pow(2, 3 - s)))
+        if bar_index >= n
+            // Mean of returns over n bars
+            float mean_r = 0.0
+            for j = 0 to n - 1
+                mean_r += nz(math.log(close[j] / close[j+1]))
+            mean_r /= n
+            
+            // Cumulative deviations
+            float cum_dev = 0.0
+            float max_dev = -1e10
+            float min_dev = 1e10
+            float sum_sq  = 0.0
+            for j = 0 to n - 1
+                float ret = nz(math.log(close[j] / close[j+1]))
+                cum_dev += (ret - mean_r)
+                max_dev := math.max(max_dev, cum_dev)
+                min_dev := math.min(min_dev, cum_dev)
+                sum_sq  += (ret - mean_r) * (ret - mean_r)
+            
+            float R = max_dev - min_dev
+            float S = math.sqrt(sum_sq / n)
+            
+            if S > 1e-10 and R > 0
+                float logRS = math.log(R / S)
+                float logN  = math.log(n)
+                sumLogRS  += logRS
+                sumLogN   += logN
+                sumLogRS2 += logRS * logN
+                sumLogN2  += logN * logN
+                count     += 1
+    
+    // Linear regression slope = Hurst exponent
+    float H = 0.5  // default: random walk
+    if count >= 2
+        denom = count * sumLogN2 - sumLogN * sumLogN
+        if math.abs(denom) > 1e-10
+            H := (count * sumLogRS2 - sumLogN * sumLogRS) / denom
+            H := math.max(0.0, math.min(1.0, H))
+    H
+
+float hurstVal = _hurst(i_hurstPeriod)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// v11: CHOPPINESS INDEX
+// ══════════════════════════════════════════════════════════════════════════════
+float atrSum   = math.sum(ta.atr(1), i_chopPeriod)
+float hiRange  = ta.highest(high, i_chopPeriod) - ta.lowest(low, i_chopPeriod)
+float chopVal  = hiRange > 0 ? 100.0 * math.log10(atrSum / hiRange) / math.log10(i_chopPeriod) : 50.0
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FILTERS
+// ══════════════════════════════════════════════════════════════════════════════
+// Volatility filter (inverted: suppress during spikes)
+float atr1  = ta.atr(1)
+float atr10 = ta.atr(10)
+bool  volOk = not i_volFilter or (atr1 <= atr10)
+
+// ADX filter
+float adxVal = _adx(14)
+bool  adxOk  = not i_adxFilter or (adxVal >= i_adxThresh)
+
+// EMA filter
+float emaLine = ta.ema(close, i_emaPeriod)
+bool  emaLong = not i_emaFilter or (close > emaLine)
+bool  emaShort = not i_emaFilter or (close < emaLine)
+
+// SMA filter
+float smaLine = ta.sma(close, i_smaPeriod)
+bool  smaLong = not i_smaFilter or (close > smaLine)
+bool  smaShort = not i_smaFilter or (close < smaLine)
+
+// v11: Hurst regime filter
+bool hurstOk = not i_hurstFilter or (hurstVal < i_hurstMRThresh)
+
+// v11: Choppiness filter (suppress during strong trends)
+bool chopOk = not i_chopFilter or (chopVal > i_chopTrend)
+
+// Combined filter state
+bool filtersLong  = volOk and adxOk and emaLong and smaLong and hurstOk and chopOk
+bool filtersShort = volOk and adxOk and emaShort and smaShort and hurstOk and chopOk
+
+// ══════════════════════════════════════════════════════════════════════════════
+// KERNEL REGRESSION — Rational Quadratic + Gaussian
+// ══════════════════════════════════════════════════════════════════════════════
+_kernelRQK(float src, int lookback, float relWeight, int regrLvl, int lag) =>
+    float sum = 0.0
+    float sumW = 0.0
+    for i = 0 to lookback - 1
+        idx = i + lag
+        w = math.pow(1.0 + (math.pow(idx, 2) / (2.0 * relWeight * math.pow(regrLvl, 2))), -relWeight)
+        sum += w * nz(src[idx])
+        sumW += w
+    sumW > 0 ? sum / sumW : src
+
+_kernelGauss(float src, int lookback, int lag) =>
+    float sum = 0.0
+    float sumW = 0.0
+    h = math.max(lookback / 4.0, 1.0)
+    for i = 0 to lookback - 1
+        idx = i + lag
+        w = math.exp(-0.5 * math.pow(idx / h, 2))
+        sum += w * nz(src[idx])
+        sumW += w
+    sumW > 0 ? sum / sumW : src
+
+float yhat1 = _kernelRQK(close, i_kernelLB, i_kernelRW, i_kernelRL, i_kernelLag)
+float yhat2 = _kernelGauss(close, i_kernelLB - 2, i_kernelLag)
+
+bool kernelBull = not i_kernelFilter or (yhat2 > yhat1)
+bool kernelBear = not i_kernelFilter or (yhat2 < yhat1)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// KNN CLASSIFICATION — with IDW voting
+// ══════════════════════════════════════════════════════════════════════════════
+// Build feature count for normalization
+int featureCount = (i_f1On ? 1 : 0) + (i_f2On ? 1 : 0) + (i_f3On ? 1 : 0) + (i_f4On ? 1 : 0) + (i_f5On ? 1 : 0) + (i_f6On ? 1 : 0)
+int maxFeatures = math.max(featureCount, 1)
+
+// Distance function
+_distance(float v1a, float v1b, float v2a, float v2b, float v3a, float v3b, float v4a, float v4b, float v5a, float v5b, float v6a, float v6b) =>
+    float d = 0.0
+    if i_distMetric == "Lorentzian"
+        if i_f1On
+            d += i_f1W * math.log(1.0 + math.abs(v1a - v1b))
+        if i_f2On
+            d += i_f2W * math.log(1.0 + math.abs(v2a - v2b))
+        if i_f3On
+            d += i_f3W * math.log(1.0 + math.abs(v3a - v3b))
+        if i_f4On
+            d += i_f4W * math.log(1.0 + math.abs(v4a - v4b))
+        if i_f5On
+            d += i_f5W * math.log(1.0 + math.abs(v5a - v5b))
+        if i_f6On
+            d += i_f6W * math.log(1.0 + math.abs(v6a - v6b))
+    else if i_distMetric == "Manhattan"
+        if i_f1On
+            d += i_f1W * math.abs(v1a - v1b)
+        if i_f2On
+            d += i_f2W * math.abs(v2a - v2b)
+        if i_f3On
+            d += i_f3W * math.abs(v3a - v3b)
+        if i_f4On
+            d += i_f4W * math.abs(v4a - v4b)
+        if i_f5On
+            d += i_f5W * math.abs(v5a - v5b)
+        if i_f6On
+            d += i_f6W * math.abs(v6a - v6b)
+    else // Euclidean
+        if i_f1On
+            d += i_f1W * math.pow(v1a - v1b, 2)
+        if i_f2On
+            d += i_f2W * math.pow(v2a - v2b, 2)
+        if i_f3On
+            d += i_f3W * math.pow(v3a - v3b, 2)
+        if i_f4On
+            d += i_f4W * math.pow(v4a - v4b, 2)
+        if i_f5On
+            d += i_f5W * math.pow(v5a - v5b, 2)
+        if i_f6On
+            d += i_f6W * math.pow(v6a - v6b, 2)
+        d := math.sqrt(d)
+    d / maxFeatures
+
+// KNN classification with progressive threshold + IDW
+var float maxDist = 0.0
+
+classify() =>
+    var result = SignalResult.new(0, 0.0, 0, 0.0)
+    
+    if bar_index < i_window
+        result
+    else
+        int   neighborCount = 0
+        int   rawVotes      = 0
+        float weightedVotes = 0.0
+        float totalWeight   = 0.0
+        float threshold     = 1e10
+        
+        // Current feature vector
+        float c1 = nz(f1_val)
+        float c2 = nz(f2_val)
+        float c3 = nz(f3_val)
+        float c4 = nz(f4_val)
+        float c5 = nz(f5_val)
+        float c6 = nz(f6_val)
+        
+        int startJ = math.max(i_fractalLag, i_labelBars + 1)
+        for j = startJ to i_window
+            if (bar_index - j) % 4 != 0  // modulo-4 spacing for diversity
+                continue
+            
+            float dist = _distance(c1, nz(f1_val[j]), c2, nz(f2_val[j]), c3, nz(f3_val[j]), c4, nz(f4_val[j]), c5, nz(f5_val[j]), c6, nz(f6_val[j]))
+            
+            if dist < threshold
+                neighborCount += 1
+                
+                // Label: what happened i_labelBars after this historical point
+                float futureClose = nz(close[j - i_labelBars])
+                float pastClose   = nz(close[j])
+                int   label = futureClose > pastClose ? 1 : -1
+                
+                // Simple vote
+                rawVotes += label
+                
+                // IDW weighted vote
+                if i_useIDW
+                    float w = 1.0 / math.max(dist, i_idwEpsilon)
+                    weightedVotes += w * label
+                    totalWeight   += w
+                
+                // Progressive threshold: after k neighbors found, tighten
+                if neighborCount >= i_k
+                    threshold := dist * i_resetFactor
+        
+        // Calculate score and confidence
+        float score = i_useIDW and totalWeight > 0 ? weightedVotes / totalWeight : float(rawVotes) / math.max(neighborCount, 1)
+        float conf  = math.abs(score)
+        
+        result.score := rawVotes
+        result.weightedScore := i_useIDW and totalWeight > 0 ? weightedVotes / totalWeight : float(rawVotes) / math.max(neighborCount, 1)
+        result.direction := conf >= i_confThresh ? (score > 0 ? 1 : score < 0 ? -1 : 0) : 0
+        result.confidence := conf
+        result
+
+SignalResult sig = classify()
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SIGNAL GENERATION & TRADE TRACKING
+// ══════════════════════════════════════════════════════════════════════════════
+bool isBull = sig.direction ==  1 and filtersLong  and kernelBull
+bool isBear = sig.direction == -1 and filtersShort and kernelBear
+
+// State tracking
+var int   posDir      = 0
+var int   holdCount   = 0
+var float entryPrice  = na
+var int   totalWins   = 0
+var int   totalLosses = 0
+
+bool buySignal  = isBull and posDir != 1
+bool sellSignal = isBear and posDir != -1
+
+// Dynamic exit
+bool exitLong  = posDir ==  1 and i_dynExit and (yhat2 < yhat1 or holdCount >= i_holdPeriod)
+bool exitShort = posDir == -1 and i_dynExit and (yhat2 > yhat1 or holdCount >= i_holdPeriod)
+
+if buySignal
+    if posDir == -1 // Record short result before reversing
+        if close < entryPrice
+            totalWins += 1
+        else
+            totalLosses += 1
+    posDir     := 1
+    holdCount  := 0
+    entryPrice := close
+else if sellSignal
+    if posDir == 1 // Record long result before reversing
+        if close > entryPrice
+            totalWins += 1
+        else
+            totalLosses += 1
+    posDir     := -1
+    holdCount  := 0
+    entryPrice := close
+else if exitLong
+    if close > entryPrice
+        totalWins += 1
+    else
+        totalLosses += 1
+    posDir     := 0
+    holdCount  := 0
+    entryPrice := na
+else if exitShort
+    if close < entryPrice
+        totalWins += 1
+    else
+        totalLosses += 1
+    posDir     := 0
+    holdCount  := 0
+    entryPrice := na
+else
+    holdCount += 1
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ENVELOPE — Kernel-Smoothed ATR
+// ══════════════════════════════════════════════════════════════════════════════
+float kHigh  = _kernelRQK(high,  i_kernelLB, i_kernelRW, i_kernelRL, i_kernelLag)
+float kLow   = _kernelRQK(low,   i_kernelLB, i_kernelRW, i_kernelRL, i_kernelLag)
+float kClose = _kernelRQK(close, i_kernelLB, i_kernelRW, i_kernelRL, i_kernelLag)
+float kTR    = math.max(kHigh - kLow, math.max(math.abs(kHigh - nz(kClose[1])), math.abs(kLow - nz(kClose[1]))))
+float kATR   = ta.rma(kTR, i_envATR)
+
+float envUpper = kClose + i_envNear * kATR
+float envLower = kClose - i_envNear * kATR
+float envFarUp = kClose + i_envFar  * kATR
+float envFarDn = kClose - i_envFar  * kATR
+
+// Mean Reversion signals
+float mrAvgUp = (envUpper + envFarUp) / 2.0
+float mrAvgDn = (envLower + envFarDn) / 2.0
+bool  mrBull  = i_showMR and close < mrAvgDn and posDir != 1
+bool  mrBear  = i_showMR and close > mrAvgUp and posDir != -1
+bool  mrStrBull = i_showMR and close < envFarDn
+bool  mrStrBear = i_showMR and close > envFarUp
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PLOTS
+// ══════════════════════════════════════════════════════════════════════════════
+// Kernel lines
+plot(i_showKernel ? yhat1 : na, "RQK Estimate", color=color.new(#ffd700, 30), linewidth=2)
+plot(i_showKernel ? yhat2 : na, "Gaussian Estimate", color=color.new(#00bfff, 30), linewidth=1)
+
+// Envelope
+p_envU = plot(i_showEnv ? envUpper : na, "Upper Band", color=color.new(i_cBear, 60))
+p_envL = plot(i_showEnv ? envLower : na, "Lower Band", color=color.new(i_cBull, 60))
+p_kc   = plot(i_showEnv ? kClose   : na, "Kernel Close", color=color.new(i_cNeutral, 80))
+fill(p_envU, p_kc, color=color.new(i_cBear, 90))
+fill(p_kc, p_envL, color=color.new(i_cBull, 90))
+
+// EMA/SMA
+plot(i_emaFilter ? emaLine : na, "EMA", color=color.new(#ffd700, 70), linewidth=1)
+plot(i_smaFilter ? smaLine : na, "SMA", color=color.new(#ffffff, 85), linewidth=1)
+
+// Signal markers
+plotshape(buySignal,  "Buy",  shape.labelup,   location.belowbar, i_cBull, size=size.small, text="▲")
+plotshape(sellSignal, "Sell", shape.labeldown,  location.abovebar, i_cBear, size=size.small, text="▼")
+plotshape(exitLong,   "Exit Long",  shape.xcross, location.abovebar, color.new(i_cBull, 50), size=size.tiny)
+plotshape(exitShort,  "Exit Short", shape.xcross, location.belowbar, color.new(i_cBear, 50), size=size.tiny)
+
+// MR signals
+plotshape(mrBull and not mrStrBull, "MR Bull", shape.diamond, location.belowbar, color.new(i_cBull, 30), size=size.tiny)
+plotshape(mrBear and not mrStrBear, "MR Bear", shape.diamond, location.abovebar, color.new(i_cBear, 30), size=size.tiny)
+plotshape(mrStrBull, "Strong MR Bull", shape.diamond, location.belowbar, #ffd700, size=size.small)
+plotshape(mrStrBear, "Strong MR Bear", shape.diamond, location.abovebar, #ffd700, size=size.small)
+
+// Bar coloring
+barcolor(i_showBarCol ? (posDir == 1 ? i_cBull : posDir == -1 ? i_cBear : i_cNeutral) : na)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STATS TABLE
+// ══════════════════════════════════════════════════════════════════════════════
+if i_showStats and barstate.islast
+    // Updated row count to 15 to include Win Rate, Wins, and Losses
+    var table statsT = table.new(position.top_right, 2, 15, bgcolor=color.new(#1a1a2e, 10), border_color=color.new(#ffffff, 80), border_width=1)
+    
+    table.cell(statsT, 0, 0, "CLC v11", text_color=#ffd700, text_size=size.small, text_halign=text.align_left)
+    table.cell(statsT, 1, 0, "", text_size=size.small)
+    
+    table.cell(statsT, 0, 1, "Direction", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(statsT, 1, 1, posDir == 1 ? "LONG" : posDir == -1 ? "SHORT" : "FLAT", text_color=posDir == 1 ? i_cBull : posDir == -1 ? i_cBear : i_cNeutral, text_size=size.tiny, text_halign=text.align_right)
+    
+    table.cell(statsT, 0, 2, "Raw Score", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(statsT, 1, 2, str.tostring(sig.score), text_color=sig.score > 0 ? i_cBull : sig.score < 0 ? i_cBear : i_cNeutral, text_size=size.tiny, text_halign=text.align_right)
+    
+    table.cell(statsT, 0, 3, "Confidence", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(statsT, 1, 3, str.tostring(sig.confidence, "#.##"), text_color=sig.confidence >= i_confThresh ? #ffd700 : i_cNeutral, text_size=size.tiny, text_halign=text.align_right)
+    
+    table.cell(statsT, 0, 4, "IDW Score", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(statsT, 1, 4, str.tostring(sig.weightedScore, "#.###"), text_color=sig.weightedScore > 0 ? i_cBull : sig.weightedScore < 0 ? i_cBear : i_cNeutral, text_size=size.tiny, text_halign=text.align_right)
+    
+    table.cell(statsT, 0, 5, "Hold Bars", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(statsT, 1, 5, str.tostring(holdCount) + "/" + str.tostring(i_holdPeriod), text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
+    
+    table.cell(statsT, 0, 6, "Distance", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(statsT, 1, 6, i_distMetric, text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
+    
+    table.cell(statsT, 0, 7, "IDW", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(statsT, 1, 7, i_useIDW ? "ON" : "OFF", text_color=i_useIDW ? i_cBull : i_cNeutral, text_size=size.tiny, text_halign=text.align_right)
+    
+    // Regime info
+    table.cell(statsT, 0, 8, "Hurst", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    string hurstState = hurstVal < i_hurstMRThresh ? "MR" : hurstVal > i_hurstRWHigh ? "TREND" : "RW"
+    color  hurstCol   = hurstVal < i_hurstMRThresh ? i_cBull : hurstVal > i_hurstRWHigh ? i_cBear : i_cNeutral
+    table.cell(statsT, 1, 8, str.tostring(hurstVal, "#.##") + " " + hurstState, text_color=hurstCol, text_size=size.tiny, text_halign=text.align_right)
+    
+    table.cell(statsT, 0, 9, "Choppiness", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    string chopState = chopVal > i_chopChoppy ? "CHOPPY" : chopVal < i_chopTrend ? "TREND" : "MID"
+    color  chopCol   = chopVal > i_chopChoppy ? i_cBull : chopVal < i_chopTrend ? i_cBear : i_cNeutral
+    table.cell(statsT, 1, 9, str.tostring(chopVal, "#.#") + " " + chopState, text_color=chopCol, text_size=size.tiny, text_halign=text.align_right)
+    
+    table.cell(statsT, 0, 10, "Filters", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    string fStr = (i_hurstFilter ? "H" : "") + (i_chopFilter ? "C" : "") + (i_volFilter ? "V" : "") + (i_adxFilter ? "A" : "") + (i_emaFilter ? "E" : "") + (i_smaFilter ? "S" : "")
+    table.cell(statsT, 1, 10, fStr, text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
+    
+    table.cell(statsT, 0, 11, "Features", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(statsT, 1, 11, str.tostring(featureCount), text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
+
+    // Calculate Win Rate
+    int totalClosedTrades = totalWins + totalLosses
+    float winRate = totalClosedTrades > 0 ? (totalWins / totalClosedTrades) * 100 : 0.0
+
+    // New Rows for PnL
+    table.cell(statsT, 0, 12, "Win Rate", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(statsT, 1, 12, str.tostring(winRate, "#.#") + "%", text_color=winRate >= 50 ? i_cBull : i_cBear, text_size=size.tiny, text_halign=text.align_right)
+    
+    table.cell(statsT, 0, 13, "Total Wins", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(statsT, 1, 13, str.tostring(totalWins), text_color=i_cBull, text_size=size.tiny, text_halign=text.align_right)
+    
+    table.cell(statsT, 0, 14, "Total Losses", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(statsT, 1, 14, str.tostring(totalLosses), text_color=i_cBear, text_size=size.tiny, text_halign=text.align_right)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ══════════════════════════════════════════════════════════════════════════════
+alertcondition(buySignal,   "CLC Buy",       "CLC v11 — BUY signal")
+alertcondition(sellSignal,  "CLC Sell",      "CLC v11 — SELL signal")
+alertcondition(exitLong,    "CLC Exit Long", "CLC v11 — Exit Long")
+alertcondition(exitShort,   "CLC Exit Short","CLC v11 — Exit Short")
+alertcondition(mrBull,      "MR Bull",       "CLC v11 — Mean Reversion Bull")
+alertcondition(mrBear,      "MR Bear",       "CLC v11 — Mean Reversion Bear")
+alertcondition(mrStrBull,   "Strong MR Bull","CLC v11 — STRONG Mean Reversion Bull")
+alertcondition(mrStrBear,   "Strong MR Bear","CLC v11 — STRONG Mean Reversion Bear")
